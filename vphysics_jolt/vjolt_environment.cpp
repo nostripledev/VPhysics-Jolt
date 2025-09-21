@@ -241,7 +241,7 @@ JoltPhysicsEnvironment::JoltPhysicsEnvironment()
 JoltPhysicsEnvironment::~JoltPhysicsEnvironment()
 {
 	// Clear any pending dead bodies.
-	DeleteDeadObjects();
+	DeleteDeadObjects(true);
 
 	// Clear out all our bodies.
 	m_PhysicsSystem.GetBodies( m_CachedBodies );
@@ -333,6 +333,8 @@ IPhysicsObject *JoltPhysicsEnvironment::CreatePolyObject( const CPhysCollide *pC
 	settings.mMassPropertiesOverride.mMass = params.mass;
 	//settings.mMassPropertiesOverride.mInertia = JPH::Mat44::sIdentity() * params.inertia;
 	settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia; // JPH::EOverrideMassProperties::MassAndInertiaProvided;
+	settings.mMaxLinearVelocity = MaxVelocity();
+	settings.mMaxAngularVelocity = MaxAngularVelocity();
 
 	if ( m_bUseLinearCast )
 		settings.mMotionQuality = JPH::EMotionQuality::LinearCast;
@@ -390,6 +392,8 @@ IPhysicsObject *JoltPhysicsEnvironment::CreateSphereObject( float radius, int ma
 		settings.mMassPropertiesOverride.mMass = params.mass;
 		//settings.mMassPropertiesOverride.mInertia = JPH::Mat44::sIdentity() * params.inertia;
 		settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;//JPH::EOverrideMassProperties::MassAndInertiaProvided;
+		settings.mMaxLinearVelocity = MaxVelocity();
+		settings.mMaxAngularVelocity = MaxAngularVelocity();
 	}
 
 	JPH::BodyInterface &bodyInterface = m_PhysicsSystem.GetBodyInterfaceNoLock();
@@ -515,14 +519,11 @@ JoltPhysicsSpring::~JoltPhysicsSpring()
 
 void JoltPhysicsSpring::GetEndpoints( Vector *worldPositionStart, Vector *worldPositionEnd )
 {
-	// TODO(Josh): Implement this.
-	Log_Stub( LOG_VJolt );
-
 	if ( worldPositionStart )
-		*worldPositionStart = vec3_origin;
+		m_pObjectStart->GetPosition(worldPositionStart, NULL);
 
 	if ( worldPositionEnd )
-		*worldPositionEnd = vec3_origin;
+		m_pObjectEnd->GetPosition(worldPositionEnd, NULL);
 }
 
 void JoltPhysicsSpring::SetSpringConstant( float flSpringConstant )
@@ -789,6 +790,9 @@ void JoltPhysicsEnvironment::Simulate( float deltaTime )
 		settings.mNumVelocitySteps = vjolt_velocity_steps.GetInt();
 		settings.mNumPositionSteps = vjolt_position_steps.GetInt();
 		settings.mDeterministicSimulation = vjolt_deterministic.GetBool();
+		// Raphael: These seem to help against objects clipping through others? Idk, should test them more and read the docs.
+		settings.mLinearCastThreshold = 0;
+		settings.mLinearCastMaxPenetration = 0;
 		m_PhysicsSystem.SetPhysicsSettings( settings );
 	}
 
@@ -806,6 +810,10 @@ void JoltPhysicsEnvironment::Simulate( float deltaTime )
 	m_ContactListener.PostSimulationFrame();
 
 	m_bSimulating = true;
+
+	// RaphaelIT7: We need to delete all dead objects after m_ContactListener.PostSimulationFrame, or else Jolt freaks out for some reason.
+	// This also needs to be before pController->OnPreSimulate or else we get some crashes.
+	DeleteDeadObjects( true );
 
 	// Run pre-simulation controllers
 	for ( IJoltPhysicsController *pController : m_pPhysicsControllers )
@@ -862,8 +870,10 @@ void JoltPhysicsEnvironment::Simulate( float deltaTime )
 
 	// If the delete queue is disabled, we only added to it during the simulation
 	// ie. callbacks etc. So flush that now.
-	if ( !m_bEnableDeleteQueue )
+	if ( !m_bEnableDeleteQueue ) {
 		DeleteDeadObjects();
+		DeleteDeadObjects( true ); // Also delete all bodies
+	}
 
 #ifdef JPH_DEBUG_RENDERER
 	JoltPhysicsDebugRenderer::GetInstance().RenderPhysicsSystem( m_PhysicsSystem );
@@ -1117,10 +1127,14 @@ void JoltPhysicsEnvironment::PreRestore( const physprerestoreparams_t &params )
 {
 	m_SaveRestorePointerMap.clear();
 
+#if defined(GAME_GMOD_64X)
+	Log_Stub( LOG_VJolt ); // Raphael (ToDo): Figure out what happens here normally... I should check the SDK again and see if we have the previous structure used by all other branches.
+#else
 	for ( int i = 0; i < params.recreatedObjectCount; i++ )
 		AddPhysicsSaveRestorePointer(
 			reinterpret_cast< uintp >( params.recreatedObjectList[ i ].pOldObject ),
 			params.recreatedObjectList[ i ].pNewObject );
+#endif
 }
 
 bool JoltPhysicsEnvironment::Restore( const physrestoreparams_t &params )
@@ -1247,14 +1261,72 @@ void JoltPhysicsEnvironment::GetPerformanceSettings( physics_performanceparams_t
 
 void JoltPhysicsEnvironment::SetPerformanceSettings( const physics_performanceparams_t *pSettings )
 {
-	if ( pSettings )
-	{
-		m_PerformanceParams = *pSettings;
+	if ( !pSettings )
+		return;
 
-		// Normalize these values to match VPhysics behaviour.
-		m_PerformanceParams.minFrictionMass = Clamp( m_PerformanceParams.minFrictionMass, 1.0f, VPHYSICS_MAX_MASS );
-		m_PerformanceParams.maxFrictionMass = Clamp( m_PerformanceParams.maxFrictionMass, 1.0f, VPHYSICS_MAX_MASS );
+	m_PerformanceParams = *pSettings;
+
+	// Normalize these values to match VPhysics behaviour.
+	m_PerformanceParams.minFrictionMass = Clamp( m_PerformanceParams.minFrictionMass, 1.0f, VPHYSICS_MAX_MASS );
+	m_PerformanceParams.maxFrictionMass = Clamp( m_PerformanceParams.maxFrictionMass, 1.0f, VPHYSICS_MAX_MASS );
+
+	m_PhysicsSystem.GetBodies(m_CachedBodies);
+
+	for ( auto& id : m_CachedBodies )
+	{
+		JPH::Body* pBody = m_PhysicsSystem.GetBodyLockInterfaceNoLock().TryGetBody( id );
+
+		if ( pBody )
+		{
+			JPH::MotionProperties* pMotionProperties = pBody->GetMotionProperties();
+
+			if ( pMotionProperties )
+			{
+				pMotionProperties->SetMaxLinearVelocity( pSettings->maxVelocity );
+				pMotionProperties->SetMaxAngularVelocity( pSettings->maxAngularVelocity * M_PI_F / 180 );
+			}
+		}
 	}
+}
+
+inline int JoltPhysicsEnvironment::MaxCollisionsPerObjectPerTimestep() const
+{
+	return m_PerformanceParams.maxCollisionsPerObjectPerTimestep;
+}
+
+inline int JoltPhysicsEnvironment::MaxCollisionChecksPerTimestep() const
+{
+	return m_PerformanceParams.maxCollisionChecksPerTimestep;
+}
+
+inline float JoltPhysicsEnvironment::MaxVelocity() const
+{
+	return m_PerformanceParams.maxVelocity;
+}
+
+inline float JoltPhysicsEnvironment::MaxAngularVelocity() const
+{
+	return m_PerformanceParams.maxAngularVelocity;
+}
+
+inline float JoltPhysicsEnvironment::LookAheadTimeObjectsVsWorld() const
+{
+	return m_PerformanceParams.lookAheadTimeObjectsVsWorld;
+}
+
+inline float JoltPhysicsEnvironment::LookAheadTimeObjectsVsObject() const
+{
+	return m_PerformanceParams.lookAheadTimeObjectsVsObject;
+}
+
+inline float JoltPhysicsEnvironment::MinFrictionMass() const
+{
+	return m_PerformanceParams.minFrictionMass;
+}
+
+inline float JoltPhysicsEnvironment::MaxFrictionMass() const
+{
+	return m_PerformanceParams.maxFrictionMass;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1474,19 +1546,21 @@ void JoltPhysicsEnvironment::RemoveBodyAndDeleteObject( JoltPhysicsObject *pObje
 	delete pObject;
 }
 
-void JoltPhysicsEnvironment::DeleteDeadObjects()
+void JoltPhysicsEnvironment::DeleteDeadObjects( bool delBodies )
 {
-	for ( JoltPhysicsObject *pObject : m_pDeadObjects )
-		RemoveBodyAndDeleteObject( pObject );
-	m_pDeadObjects.clear();
+	if ( delBodies ) {
+		for ( JoltPhysicsObject *pObject : m_pDeadObjects )
+			RemoveBodyAndDeleteObject( pObject );
+		m_pDeadObjects.clear();
+	} else {
+		for ( JoltPhysicsConstraint *pConstraint : m_pDeadConstraints )
+			delete pConstraint;
+		m_pDeadConstraints.clear();
 
-	for ( JoltPhysicsConstraint *pConstraint : m_pDeadConstraints )
-		delete pConstraint;
-	m_pDeadConstraints.clear();
-
-	for ( CPhysCollide *pCollide : m_pDeadObjectCollides )
-		JoltPhysicsCollision::GetInstance().DestroyCollide( pCollide );
-	m_pDeadObjectCollides.clear();
+		for ( CPhysCollide *pCollide : m_pDeadObjectCollides )
+			JoltPhysicsCollision::GetInstance().DestroyCollide( pCollide );
+		m_pDeadObjectCollides.clear();
+	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1549,3 +1623,16 @@ void JoltPhysicsEnvironment::HandleDebugDumpingEnvironment( void *pReturnAddress
 	s_bShouldDumpEnvironmentClient = false;
 	s_bShouldDumpEnvironmentServer = false;
 }
+
+#if defined(GAME_GMOD_64X)
+// NOTE: physprerestoreparams_t was named to physpresaverestoreparams_t though we kept the original for now.
+void JoltPhysicsEnvironment::PreSave(const physprerestoreparams_t& params)
+{
+	Log_Stub( LOG_VJolt );
+}
+
+void JoltPhysicsEnvironment::PostSave()
+{
+	Log_Stub( LOG_VJolt );
+}
+#endif
