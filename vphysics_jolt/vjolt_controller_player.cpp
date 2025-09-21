@@ -221,6 +221,9 @@ void JoltPhysicsPlayerController::OnContactAdded( const JPH::CharacterVirtual* i
 
 static void CheckCollision( JoltPhysicsObject *pObject, JPH::CollideShapeCollector &ioCollector, JPH::BodyFilter &ioFilter )
 {
+	if ( !pObject->IsCollisionEnabled() ) 
+	    return;
+	
 	JPH::PhysicsSystem *pSystem = pObject->GetEnvironment()->GetPhysicsSystem();
 
 	if ( !pObject->IsCollisionEnabled() )
@@ -288,7 +291,8 @@ private:
 uint32 JoltPhysicsPlayerController::GetContactState( uint16 nGameFlags )
 {
 	// This does not seem to affect much, we should aspire to have our physics be as 1:1 to brush collisions as possible anyway
-#ifdef GAME_PORTAL2_OR_NEWER
+	// Raphael: I was getting stuck at the slightest touch with this enabled on 64x Gmod.
+#if defined(GAME_PORTAL2_OR_NEWER) && !defined(GAME_GMOD)
 	if ( !m_pObject->IsCollisionEnabled() )
 		return 0;
 
